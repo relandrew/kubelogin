@@ -10,6 +10,24 @@ This is a [client-go credential (exec) plugin](https://kubernetes.io/docs/refere
 
 Check out [the official doc page](https://azure.github.io/kubelogin/index.html) for more details
 
+## Features in this fork
+
+For avoiding having to log out and redo device login to pick up JIT groups:
+
+  - set the environment variable `KUBELOGIN_FORCE_REFRESH=1` to make
+    `kubelogin` use its refresh token to get a new access token, instead of
+    using the cached one that may not have the JIT groups.
+
+  - set the environment variable `KUBELOGIN_VERBOSE=10` to enable debug
+    logging
+
+To install:
+
+  1. Check out this repo
+  2. Run `go install`
+  3. Make sure `~/go/bin` comes earlier in your `$PATH` than wherever the
+     pre-existing `kubelogin` binary is
+
 ## Installation
 
 https://azure.github.io/kubelogin/install.html

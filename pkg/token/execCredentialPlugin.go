@@ -3,9 +3,20 @@ package token
 //go:generate sh -c "mockgen -destination mock_$GOPACKAGE/execCredentialPlugin.go github.com/Azure/kubelogin/pkg/token ExecCredentialPlugin"
 
 import (
+	"context"
 	"fmt"
 	"os"
+	"reflect"
+	"sort"
 	"time"
+
+	"github.com/google/uuid"
+
+	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
+	"github.com/golang-jwt/jwt/v4"
+	msgraphsdkgo "github.com/microsoftgraph/msgraph-sdk-go"
+	"github.com/microsoftgraph/msgraph-sdk-go/groups"
+	"github.com/microsoftgraph/msgraph-sdk-go/models"
 
 	"github.com/Azure/go-autorest/autorest/adal"
 	klog "k8s.io/klog/v2"
@@ -49,6 +60,93 @@ func New(o *Options) (ExecCredentialPlugin, error) {
 	}, nil
 }
 
+func (p *execCredentialPlugin) write(token adal.Token) error {
+	p.logTokenInfo(token)
+
+	return p.execCredentialWriter.Write(token, os.Stdout)
+}
+
+const logTokenLevel = 5
+
+// Interceptor that debug-logs token expiry and groups
+func (p *execCredentialPlugin) logTokenInfo(token adal.Token) {
+
+	if !klog.V(logTokenLevel).Enabled() {
+		return
+	}
+
+	klog.V(logTokenLevel).Infof("token expires in %v", token.Expires().Sub(time.Now()))
+
+	err := p.logGroups(token)
+	if err != nil {
+		klog.V(logTokenLevel).Infof("warning: unable to log groups: %s", err.Error())
+	}
+}
+
+func (p *execCredentialPlugin) logGroups(token adal.Token) error {
+	type MyClaims struct {
+		jwt.RegisteredClaims
+		Groups []string `json:"groups,omitempty"`
+	}
+
+	var claims MyClaims
+	_, _, err := jwt.NewParser().ParseUnverified(token.AccessToken, &claims)
+	if err != nil {
+		return fmt.Errorf("failed to parse tokekn as jwt: %w", err)
+	}
+
+	if claims.Groups == nil || len(claims.Groups) == 0 {
+		return nil
+	}
+
+	groupNames := []string{}
+
+	v := reflect.Indirect(reflect.ValueOf(p.provider)).FieldByName("tenantID")
+	if v.Type().Kind() == reflect.String {
+		tenantID := v.String()
+		_, err := uuid.Parse(tenantID)
+		tenantIDisGUID := err == nil
+
+		credOptions := azidentity.DefaultAzureCredentialOptions{}
+		if tenantIDisGUID {
+			credOptions.TenantID = tenantID
+		}
+
+		cred, err := azidentity.NewDefaultAzureCredential(&credOptions)
+		if err != nil {
+			return fmt.Errorf("failed to get azure credential: %w", err)
+		}
+		gc, err := msgraphsdkgo.NewGraphServiceClientWithCredentials(cred, nil)
+		if err != nil {
+			return fmt.Errorf("failed to create msgraph client: %w", err)
+		}
+		body := groups.NewGetByIdsPostRequestBody()
+		body.SetIds(claims.Groups)
+		r, err := gc.Groups().GetByIds().Post(context.TODO(), body, nil)
+		if err != nil {
+			return fmt.Errorf("failed to get identities of groups %v: %w", claims.Groups, err)
+		}
+
+		groups := r.GetValue()
+		for _, g := range groups {
+			g2 := g.(models.Groupable)
+			groupNames = append(groupNames, *g2.GetDisplayName())
+		}
+	} else {
+		groupNames = claims.Groups
+	}
+
+	sort.Strings(groupNames)
+	if len(groupNames) > 0 {
+		klog.V(logTokenLevel).Infof("Token group names:")
+	}
+	for _, g := range groupNames {
+		klog.V(logTokenLevel).Infof("  - %v", g)
+	}
+
+	return nil
+}
+
 func (p *execCredentialPlugin) Do() error {
 	var (
 		token adal.Token
@@ -69,9 +167,9 @@ func (p *execCredentialPlugin) Do() error {
 	}
 	if token.Resource == targetAudience && !token.IsZero() {
 		// if not expired, return
-		if !token.WillExpireIn(expirationDelta) {
+		if os.Getenv("KUBELOGIN_FORCE_REFRESH") == "" && !token.WillExpireIn(expirationDelta) {
 			klog.V(10).Info("access token is still valid. will return")
-			return p.execCredentialWriter.Write(token, os.Stdout)
+			return p.write(token)
 		}
 
 		// if expired, try refresh when refresh token exists
@@ -103,7 +201,7 @@ func (p *execCredentialPlugin) Do() error {
 					return fmt.Errorf("failed to write to store: %s", err)
 				}
 
-				return p.execCredentialWriter.Write(token, os.Stdout)
+				return p.write(token)
 			}
 		} else {
 			klog.V(5).Info("there is no refresh token")
@@ -124,5 +222,5 @@ func (p *execCredentialPlugin) Do() error {
 		}
 	}
 
-	return p.execCredentialWriter.Write(token, os.Stdout)
+	return p.write(token)
 }
